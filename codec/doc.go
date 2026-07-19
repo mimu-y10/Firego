@@ -4,5 +4,5 @@ package codec
 
 type Codec interface {
 	Encode(v any) (map[string]any, error)
-	Deocde(data map[string]any, dst any) error
+	Decode(data map[string]any, dst any) error
 }
