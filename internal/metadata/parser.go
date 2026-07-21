@@ -14,7 +14,7 @@ func Parse[T any](collection string) (*schema.Schema, error) {
 		return nil, fmt.Errorf("metadata: collection must not be empty")
 	}
 
-	modelType := reflect.TypeOf((*T)(nil)).Elem()
+	modelType := reflect.TypeFor[T]()
 	for modelType.Kind() == reflect.Pointer {
 		modelType = modelType.Elem()
 	}
@@ -23,47 +23,19 @@ func Parse[T any](collection string) (*schema.Schema, error) {
 		return nil, fmt.Errorf("metadata: model must be a struct")
 	}
 
-	// Preallocate enough capacity for every struct field while keeping the
-	// length at zero, because unexported and firestore:"-" fields are skipped
-	// and only mapped fields should be appended to the result.
-	fields := make([]schema.Field, 0, modelType.NumField())
+	fields, err := collectFields(modelType, nil)
+	if err != nil {
+		return nil, err
+	}
+
 	idFieldIndex := -1
-
-	for i := 0; i < modelType.NumField(); i++ {
-		structField := modelType.Field(i)
-
-		if !structField.IsExported() {
-			continue
-		}
-
-		isID := structField.Tag.Get("firego") == "id"
-		firestoreName := parseFirestoreName(structField)
-
-		// A field ignored by the Firestore codec is only relevant when it holds
-		// the document ID.
-		if firestoreName == "-" && !isID {
-			continue
-		}
-
-		if isID {
+	for i, f := range fields {
+		if f.IsID {
 			if idFieldIndex >= 0 {
 				return nil, fmt.Errorf("metadata: multiple ID fields")
 			}
-
-			if structField.Type.Kind() != reflect.String {
-				return nil, fmt.Errorf("metadata: ID field %q must be a string", structField.Name)
-			}
-
-			idFieldIndex = len(fields)
+			idFieldIndex = i
 		}
-
-		fields = append(fields, schema.Field{
-			Name:          structField.Name,
-			FirestoreName: firestoreName,
-			GoType:        structField.Type,
-			StructIndex:   structField.Index,
-			IsID:          isID,
-		})
 	}
 
 	result := &schema.Schema{
@@ -78,6 +50,70 @@ func Parse[T any](collection string) (*schema.Schema, error) {
 	}
 
 	return result, nil
+}
+
+// collectFields walks t and returns schema.Field entries for every mapped
+// field. Anonymous (embedded) struct fields whose firestore tag carries no
+// explicit name are promoted — their inner fields are appended directly, with
+// StructIndex extended by the embedding position — matching the behaviour of
+// the Firestore Go SDK encoder/decoder.
+func collectFields(t reflect.Type, indexPrefix []int) ([]schema.Field, error) {
+	fields := make([]schema.Field, 0, t.NumField())
+
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+
+		// Build the full reflection path to this field.
+		structIndex := append(append([]int(nil), indexPrefix...), i)
+
+		// Anonymous (embedded) fields: handle before the exported check.
+		// Unexported anonymous struct types are promoted just like exported
+		// ones — matching encoding/json and Firestore SDK behaviour — because
+		// their own exported fields remain accessible on the outer struct.
+		if sf.Anonymous {
+			embeddedType := sf.Type
+			for embeddedType.Kind() == reflect.Pointer {
+				embeddedType = embeddedType.Elem()
+			}
+			tagName, _, _ := strings.Cut(sf.Tag.Get("firestore"), ",")
+			// Promote when no explicit firestore name is given.
+			// Unexported anonymous types can never carry a meaningful tag, so
+			// also promote them even if a tag is present.
+			if embeddedType.Kind() == reflect.Struct && (tagName == "" || !sf.IsExported()) {
+				promoted, err := collectFields(embeddedType, structIndex)
+				if err != nil {
+					return nil, err
+				}
+				fields = append(fields, promoted...)
+				continue
+			}
+		}
+
+		if !sf.IsExported() {
+			continue
+		}
+
+		isID := sf.Tag.Get("firego") == "id"
+		firestoreName := parseFirestoreName(sf)
+
+		if firestoreName == "-" && !isID {
+			continue
+		}
+
+		if isID && sf.Type.Kind() != reflect.String {
+			return nil, fmt.Errorf("metadata: ID field %q must be a string", sf.Name)
+		}
+
+		fields = append(fields, schema.Field{
+			Name:          sf.Name,
+			FirestoreName: firestoreName,
+			GoType:        sf.Type,
+			StructIndex:   structIndex,
+			IsID:          isID,
+		})
+	}
+
+	return fields, nil
 }
 
 func parseFirestoreName(field reflect.StructField) string {
